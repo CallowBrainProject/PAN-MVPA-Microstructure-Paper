@@ -1,0 +1,1245 @@
+---
+title: "PAN Physical Activity and Cortical Microstructure Analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: hide
+params:
+  data_file: "/Users/danielcallow/Downloads/data_export_2026-01-26 16_08_34.090270.csv"
+  output_dir: "PAN_outputs"
+  run_extended_diagnostics: false
+---
+
+This report contains the current physical activity and cortical microstructure
+analysis. Set `data_file` and `output_dir` in the parameters above before knitting. The original filtering, recoding, standardization populations, regression
+formulas, HC3 inference, and FDR families are retained in the main analysis.
+
+The final complete-case sample is `df_pr`. Outcomes are standardized before
+filtering, and predictors after eligibility filtering but before complete-case
+selection, matching the original script. Figure confidence bands use conventional
+OLS inference; the main result tables use HC3 standard errors.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE)
+required_packages <- c(
+  "tidyverse", "janitor", "broom", "car", "GGally", "gtsummary",
+  "gt", "lmtest", "sandwich", "patchwork"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install these packages before knitting: ",
+       paste(missing_packages, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+Sys.setenv(VROOM_CONNECTION_SIZE = 8388608)
+output_dir <- params$output_dir
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+# Import data
+
+```{r import-data}
+file_path <- params$data_file
+if (!file.exists(file_path)) stop("Data file not found: ", file_path, call. = FALSE)
+
+df_raw <- read_csv(
+  file_path,
+  skip = 9,
+  show_col_types = FALSE,
+  guess_max = 50000,
+  progress = FALSE
+) %>%
+  clean_names()
+
+cat("Rows:", nrow(df_raw), "\n")
+cat("Columns:", ncol(df_raw), "\n")
+names(df_raw)
+glimpse(df_raw)
+```
+
+
+# Vascular risk and ethnicity recodes
+
+Missing vascular risk components are coded as zero in the original analysis; this behavior is preserved. The derived `hispanic_latino_bin` is retained, while the models use `hispanic_latino_hml`.
+
+```{r vascular-risk}
+df_raw <- df_raw %>%
+  mutate(
+    bmi = (bio_weight / (bio_height^2)) * 703
+  )
+
+df_raw <- df_raw %>%
+  mutate(
+    vrf_obesity = if_else(bmi > 30, 1L, 0L, missing = 0L),
+
+    vrf_diabetes = if_else(
+      health_medical_type_1_diabetes == 1 |
+      health_medical_type_2_diabetes == 1,
+      1L, 0L, missing = 0L
+    ),
+
+    vrf_smoking = if_else(
+      health_medical_smoking == 1,
+      1L, 0L, missing = 0L
+    ),
+
+    vrf_hypertension = if_else(
+      health_medical_hypertension == 1,
+      1L, 0L, missing = 0L
+    ),
+
+    vrf_cholesterol = if_else(
+      cholesterol > 200,
+      1L, 0L, missing = 0L
+    )
+  )
+
+df_raw <- df_raw %>%
+  mutate(
+    vascular_risk_count =
+      vrf_obesity +
+      vrf_diabetes +
+      vrf_smoking +
+      vrf_hypertension +
+      vrf_cholesterol,
+
+    vascular_risk_cat = case_when(
+      vascular_risk_count == 0 ~ "0",
+      vascular_risk_count == 1 ~ "1",
+      vascular_risk_count >= 2 ~ "2+",
+      TRUE ~ NA_character_
+    ),
+    vascular_risk_cat = factor(
+      vascular_risk_cat,
+      levels = c("0", "1", "2+")
+    )
+  )
+
+df_raw <- df_raw %>%
+  mutate(
+    hispanic_latino_bin = if_else(
+      hispanic_latino == "Yes",
+      1L,
+      0L
+    ),
+    hispanic_latino_bin = factor(
+      hispanic_latino_bin,
+      levels = c(0, 1),
+      labels = c("No / Not Hispanic", "Hispanic")
+    )
+  )
+```
+
+
+# Imaging and demographic variables
+
+Education and race remain factors, matching the source code. Education is therefore modeled categorically, despite the manuscript describing an ordinal coding.
+
+```{r derived-variables}
+df_raw <- df_raw %>%
+  mutate(
+    site = factor(site),
+
+    # Normalized cortical volume: cortical gray matter volume / eTIV
+    cortexvol_norm_etiv =
+      coree_chen_anat_measures_freesurfer_aseg_cortexvol /
+      coree_chen_anat_measures_freesurfer_aseg_etiv,
+
+    extra_neurite_fraction_cortex =
+      pmax(
+        1 -
+          coree_chen_dwi_measures_noddi_gm_gmcort_fit_ndi_cerebral_cortex -
+          coree_chen_dwi_measures_noddi_gm_gmcort_fit_fwf_cerebral_cortex,
+        0
+      ),
+
+    edu_cat = case_when(
+      highest_education_level_completed %in% c(
+        "Some High School",
+        "High School Diploma (Baccalaureate)"
+      ) ~ 0,
+      highest_education_level_completed == "Some College (Some University)" ~ 1,
+      highest_education_level_completed == "College Degree (University Graduate)" ~ 2,
+      highest_education_level_completed ==
+        "Post Graduate Degree (Masters or Doctorate)" ~ 3,
+      TRUE ~ NA_real_
+    ),
+
+    race_cat = case_when(
+      race == "Black or African American" ~ 1,
+      race == "White" ~ 2,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(
+    edu_cat = factor(
+      edu_cat,
+      levels = 0:3,
+      labels = c(
+        "HS or less",
+        "Some college",
+        "College degree",
+        "Post-graduate"
+      )
+    ),
+    race_cat = factor(
+      race_cat,
+      levels = c(0, 1, 2),
+      labels = c(
+        "Other / Not White or Black",
+        "Black",
+        "White"
+      )
+    )
+  )
+```
+
+
+# Standardize outcomes
+
+```{r standardize-outcomes}
+by_site_outcomes <- c(
+  "coree_chen_dwi_measures_noddi_gm_gmcort_fit_fwf_cerebral_cortex",
+  "coree_chen_dwi_measures_noddi_gm_gmcort_fit_ndi_cerebral_cortex",
+  "coree_chen_dwi_measures_noddi_gm_gmcort_fit_odi_cerebral_cortex",
+  "coree_chen_dwi_measures_tensor_gm_gmcort_desc_adc_cerebral_cortex",
+  "cortexvol_norm_etiv"
+)
+
+df_raw <- df_raw %>%
+  group_by(site) %>%
+  mutate(
+    across(
+      all_of(by_site_outcomes),
+      ~ as.numeric(scale(.x)),
+      .names = "{.col}_z_site"
+    )
+  ) %>%
+  ungroup()
+
+outcomes_y <- paste0(by_site_outcomes, "_z_site")
+
+# 1B) Create globally z-scored outcomes for sensitivity analyses
+#     These are NOT standardized within site
+
+df_raw <- df_raw %>%
+  mutate(
+    across(
+      all_of(by_site_outcomes),
+      ~ as.numeric(scale(.x)),
+      .names = "{.col}_z_global"
+    )
+  )
+
+outcomes_global_z <- paste0(by_site_outcomes, "_z_global")
+```
+
+
+# Analysis specification and eligibility
+
+```{r analysis-specification}
+predictors <- c(
+  "mvpa_min",
+  "mean_daily_10hr_steps"
+)
+
+covariates <- c(
+  "age_hml",
+  "sex_hml",
+  "edu_cat",
+  "race_cat",
+  "apoe_e4_carrier",
+  "days_of_recording",
+  "site",
+  "hispanic_latino_hml",
+  "vascular_risk_cat"
+)
+
+# 3) Build analysis dataset
+df_analysis <- df_raw %>%
+  filter(
+    days_of_recording >= 6,
+    days_of_recording <= 31,
+    daily_monitoring_hr >= 20
+  ) %>%
+  mutate(
+    sex_hml = factor(sex_hml),
+    site = factor(site),
+
+    apoe_e4_carrier = case_when(
+      coreg_huentelman_apoe4_apoe_status %in% c("e3e4", "e4e4", "e2e4") ~ 1,
+      coreg_huentelman_apoe4_apoe_status %in% c("e2e2", "e2e3", "e3e3") ~ 0,
+      TRUE ~ NA_real_
+    ),
+
+    mvpa_min = mean_moderate_intensity_duration_minute +
+      mean_vigorous_intensity_duration_minute,
+
+    cortexvol_norm_etiv =
+      coree_chen_anat_measures_freesurfer_aseg_cortexvol /
+      coree_chen_anat_measures_freesurfer_aseg_etiv
+  ) %>%
+  filter(
+    mean_daily_10hr_steps > 100,
+    mean_daily_10hr_steps <= 25000,
+    mvpa_min >= 0,
+    #moca_total > 23,
+    coree_chen_dwi_measures_tensor_gm_gmcort_desc_adc_cerebral_cortex < 0.0016,
+    is.finite(cortexvol_norm_etiv),
+    coree_chen_anat_measures_freesurfer_aseg_etiv > 0,
+    coree_chen_anat_measures_freesurfer_aseg_cortexvol > 0
+  ) %>%
+  mutate(
+    # skew-robust sensitivity versions
+    mvpa_min_log = log1p(mvpa_min),
+    mean_daily_10hr_steps_log = log1p(mean_daily_10hr_steps)
+  )
+
+# 4) Standardize predictors globally
+df_analysis <- df_analysis %>%
+  mutate(
+    across(
+      all_of(predictors),
+      ~ as.numeric(scale(.x)),
+      .names = "{.col}_z"
+    ),
+    across(
+      c(mvpa_min_log, mean_daily_10hr_steps_log),
+      ~ as.numeric(scale(.x)),
+      .names = "{.col}_z"
+    )
+  )
+
+predictors_z <- c("mvpa_min_z", "mean_daily_10hr_steps_z")
+predictors_log_z <- c("mvpa_min_log_z", "mean_daily_10hr_steps_log_z")
+outcomes_z <- outcomes_y
+```
+
+
+# Model helper
+
+For multilevel factors, VIF output retains GVIF, degrees of freedom, and adjusted GVIF. Sorting uses adjusted GVIF instead of treating raw GVIF as ordinary VIF; the original 5/10 screening flags are retained and should be interpreted with the metric shown.
+
+```{r model-helper}
+run_lm <- function(outcome, predictors_z, covariates, data, robust_type = "HC3") {
+  f <- as.formula(
+    paste(outcome, "~", paste(c(predictors_z, covariates), collapse = " + "))
+  )
+
+  lm_fit <- lm(f, data = data)
+
+  # conventional OLS output
+  out_tbl_ols <- broom::tidy(lm_fit, conf.int = TRUE) %>%
+    mutate(
+      outcome = outcome,
+      se_type = "OLS"
+    )
+
+  # robust HC3 output
+  vcov_rob <- sandwich::vcovHC(lm_fit, type = robust_type)
+  ct_rob   <- lmtest::coeftest(lm_fit, vcov. = vcov_rob)
+
+  out_tbl_rob <- broom::tidy(ct_rob) %>%
+    mutate(
+      conf.low = estimate - qt(0.975, df = df.residual(lm_fit)) * std.error,
+      conf.high = estimate + qt(0.975, df = df.residual(lm_fit)) * std.error,
+      outcome = outcome,
+      se_type = robust_type
+    ) %>%
+    dplyr::select(term, estimate, std.error, statistic, p.value, conf.low, conf.high, outcome, se_type)
+
+  vif_values <- car::vif(lm_fit)
+  if (is.matrix(vif_values)) {
+    vif_tbl <- as.data.frame(vif_values) %>%
+      tibble::rownames_to_column("term") %>%
+      mutate(vif = .data[["GVIF^(1/(2*Df))"]], vif_metric = "Adjusted GVIF")
+  } else {
+    vif_tbl <- tibble(term = names(vif_values), vif = as.numeric(vif_values),
+                      vif_metric = "VIF")
+  }
+  vif_tbl <- vif_tbl %>% mutate(outcome = outcome)
+
+  list(
+    model = lm_fit,
+    tidy_ols = out_tbl_ols,
+    tidy_robust = out_tbl_rob,
+    vif = vif_tbl
+  )
+}
+```
+
+
+# Final complete-case sample
+
+```{r complete-cases}
+analysis_vars <- unique(c(
+  outcomes_z,          # within-site z outcomes
+  outcomes_global_z,   # global z outcomes for sensitivity analysis
+  by_site_outcomes,
+  predictors,
+  predictors_z,
+  predictors_log_z,
+  covariates,
+  "daily_monitoring_hr",
+  "moca_total",
+  "cortexvol_norm_etiv",
+  "mvpa_min_log",
+  "mean_daily_10hr_steps_log"
+))
+
+df_pr <- df_analysis %>%
+  dplyr::select(all_of(analysis_vars)) %>%
+  tidyr::drop_na() %>%
+  dplyr::filter(if_all(where(is.numeric), is.finite))
+
+cat("N in df_analysis:", nrow(df_analysis), "\n")
+cat("N in df_pr:", nrow(df_pr), "\n")
+```
+
+
+# Bivariate associations
+
+```{r bivariate-associations}
+df_biv <- df_pr %>%
+  dplyr::select(
+    mvpa_min,
+    mean_daily_10hr_steps,
+    coree_chen_dwi_measures_tensor_gm_gmcort_desc_adc_cerebral_cortex,
+    coree_chen_dwi_measures_noddi_gm_gmcort_fit_fwf_cerebral_cortex,
+    coree_chen_dwi_measures_noddi_gm_gmcort_fit_ndi_cerebral_cortex,
+    coree_chen_dwi_measures_noddi_gm_gmcort_fit_odi_cerebral_cortex
+    #noddi_wm_wmintra_desc_icvf_cerebral_white_matter,
+    #noddi_wm_wmintra_desc_isovf_cerebral_white_matter,
+    #noddi_wm_wmintra_desc_od_cerebral_white_matter,
+    #tensor_wm_wmintra_desc_adc_cerebral_white_matter,
+    #tensor_wm_wmintra_desc_fa_cerebral_white_matter
+  ) %>%
+  rename(
+    MVPA = mvpa_min,
+    Steps = mean_daily_10hr_steps,
+    MD_GM = coree_chen_dwi_measures_tensor_gm_gmcort_desc_adc_cerebral_cortex,
+    FWF_GM = coree_chen_dwi_measures_noddi_gm_gmcort_fit_fwf_cerebral_cortex,
+    NDI_GM = coree_chen_dwi_measures_noddi_gm_gmcort_fit_ndi_cerebral_cortex,
+    ODI_GM = coree_chen_dwi_measures_noddi_gm_gmcort_fit_odi_cerebral_cortex
+    #NDI_WM = noddi_wm_wmintra_desc_icvf_cerebral_white_matter,
+    #FWF_WM = noddi_wm_wmintra_desc_isovf_cerebral_white_matter,
+    #ODI_WM = noddi_wm_wmintra_desc_od_cerebral_white_matter,
+    #MD_WM = tensor_wm_wmintra_desc_adc_cerebral_white_matter,
+    #FA_WM = tensor_wm_wmintra_desc_fa_cerebral_white_matter
+  )
+
+vars_biv <- names(df_biv)
+
+get_cor_results <- function(data, vars, method = "pearson") {
+  combn(vars, 2, simplify = FALSE) %>%
+    purrr::map_dfr(function(v) {
+      tt <- suppressWarnings(
+        cor.test(
+          data[[v[1]]],
+          data[[v[2]]],
+          method = method,
+          exact = FALSE
+        )
+      )
+
+      out <- broom::tidy(tt) %>%
+        mutate(
+          var1 = v[1],
+          var2 = v[2],
+          comparison = paste(v[1], "vs", v[2]),
+          method = method,
+          .before = 1
+        )
+
+      # make sure CI columns exist even when cor.test/broom does not return them
+      if (!"conf.low" %in% names(out)) out$conf.low <- NA_real_
+      if (!"conf.high" %in% names(out)) out$conf.high <- NA_real_
+
+      out
+    }) %>%
+    mutate(
+      p_fdr = p.adjust(p.value, method = "fdr")
+    ) %>%
+    dplyr::select(
+      method, comparison, var1, var2,
+      estimate, conf.low, conf.high, p.value, p_fdr
+    )
+}
+
+biv_pearson <- get_cor_results(df_biv, vars_biv, method = "pearson") %>%
+  mutate(
+    across(c(estimate, conf.low, conf.high), ~ round(.x, 3)),
+    p.value = signif(p.value, 3),
+    p_fdr = signif(p_fdr, 3)
+  )
+
+biv_spearman <- get_cor_results(df_biv, vars_biv, method = "spearman") %>%
+  mutate(
+    estimate = round(estimate, 3),
+    conf.low = round(conf.low, 3),
+    conf.high = round(conf.high, 3),
+    p.value = signif(p.value, 3),
+    p_fdr = signif(p_fdr, 3)
+  )
+
+biv_pearson
+biv_spearman
+```
+
+
+# Bivariate figure
+
+```{r bivariate-figure}
+panel_cor <- function(data, mapping, digits = 3, prefix = "Corr: ", method = "pearson", ...) {
+  x <- eval_data_col(data, mapping$x)
+  y <- eval_data_col(data, mapping$y)
+
+  test <- suppressWarnings(cor.test(x, y, method = method))
+  r <- unname(test$estimate)
+  p <- test$p.value
+
+  stars <- case_when(
+    p < .001 ~ "***",
+    p < .01  ~ "**",
+    p < .05  ~ "*",
+    TRUE ~ ""
+  )
+
+  label <- paste0(prefix, "\n", format(round(r, digits), nsmall = digits), stars)
+
+  ggally_text(
+    label = label,
+    mapping = aes(),
+    xP = 0.5,
+    yP = 0.5,
+    size = 8,
+    color = "grey40"
+  ) +
+    theme_void()
+}
+
+p_pairs <- GGally::ggpairs(
+  df_biv,
+  upper = list(continuous = wrap(panel_cor, method = "pearson")),
+  lower = list(continuous = wrap("smooth_loess", alpha = 0.5, size = 0.2)),
+  diag  = list(continuous = "densityDiag")
+) +
+  theme_bw(base_size = 14)
+
+p_pairs
+```
+
+
+# Participant characteristics
+
+```{r participant-characteristics}
+df_table1 <- df_pr %>%
+  mutate(
+    sex_hml = case_when(
+      as.character(sex_hml) %in% c("0", "0.0", "Female", "female", "F", "f") ~ "Female",
+      as.character(sex_hml) %in% c("1", "1.0", "Male", "male", "M", "m") ~ "Male",
+      TRUE ~ as.character(sex_hml)
+    ),
+    sex_hml = factor(sex_hml),
+
+    apoe_e4_carrier = factor(
+      apoe_e4_carrier,
+      levels = c(0, 1),
+      labels = c("Non-carrier", "Carrier")
+    ),
+
+    hispanic_latino_hml = case_when(
+      as.character(hispanic_latino_hml) %in% c("0", "0.0", "No", "No / Not Hispanic", "Not Hispanic") ~ "No / Not Hispanic",
+      as.character(hispanic_latino_hml) %in% c("1", "1.0", "Yes", "Hispanic") ~ "Hispanic",
+      TRUE ~ as.character(hispanic_latino_hml)
+    ),
+    hispanic_latino_hml = factor(hispanic_latino_hml)
+  )
+
+table1 <- df_table1 %>%
+  dplyr::select(
+    age_hml,
+    sex_hml,
+    edu_cat,
+    race_cat,
+    hispanic_latino_hml,
+    apoe_e4_carrier,
+    vascular_risk_cat,
+    days_of_recording,
+    daily_monitoring_hr,
+    mvpa_min,
+    mean_daily_10hr_steps,
+    cortexvol_norm_etiv,
+    moca_total
+  ) %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 2,
+      mvpa_min ~ 1,
+      mean_daily_10hr_steps ~ 0
+    ),
+    label = list(
+      age_hml ~ "Age, years",
+      sex_hml ~ "Sex",
+      edu_cat ~ "Education",
+      race_cat ~ "Race",
+      hispanic_latino_hml ~ "Ethnicity",
+      apoe_e4_carrier ~ "APOE ε4 carrier",
+      vascular_risk_cat ~ "Vascular risk category",
+      days_of_recording ~ "Valid recording days",
+      daily_monitoring_hr ~ "Monitoring hours/day",
+      mvpa_min ~ "MVPA, min/day",
+      mean_daily_10hr_steps ~ "Mean daily step count",
+      moca_total ~ "MoCA score"
+    ),
+    missing = "no"
+  ) %>%
+  bold_labels() %>%
+  modify_caption(
+    paste0("**Table 1. Participant characteristics (N = ", nrow(df_pr), ")**")
+  ) %>%
+  as_gt()
+
+table1
+```
+
+
+# Primary regression results
+
+The original FDR adjustment spans both activity predictors across all five outcomes. This is preserved; it is broader than the manuscript’s stated NODDI-only family.
+
+```{r primary-models}
+fits <- purrr::map(
+  outcomes_z,
+  ~ run_lm(
+    outcome      = .x,
+    predictors_z = predictors_z,
+    covariates   = covariates,
+    data         = df_pr,
+    robust_type  = "HC3"
+  )
+)
+names(fits) <- outcomes_z
+
+# Collect results ---------------------------------------------------------
+all_tidy_ols    <- purrr::map_dfr(fits, "tidy_ols")
+all_tidy_robust <- purrr::map_dfr(fits, "tidy_robust")
+all_vif         <- purrr::map_dfr(fits, "vif")
+
+# Primary manuscript results: HC3 robust SEs -----------------------------
+results_main <- all_tidy_robust %>%
+  filter(term %in% predictors_z) %>%
+  dplyr::select(outcome, term, estimate, std.error, conf.low, conf.high, p.value, se_type) %>%
+  mutate(
+    p_fdr = p.adjust(p.value, method = "fdr")
+  ) %>%
+  arrange(outcome, p.value)
+
+results_main
+
+# Optional comparison table: OLS vs HC3 ----------------------------------
+results_compare <- bind_rows(
+  all_tidy_ols %>%
+    filter(term %in% predictors_z) %>%
+    dplyr::select(outcome, term, estimate, std.error, conf.low, conf.high, p.value, se_type),
+  all_tidy_robust %>%
+    filter(term %in% predictors_z) %>%
+    dplyr::select(outcome, term, estimate, std.error, conf.low, conf.high, p.value, se_type)
+) %>%
+  arrange(outcome, term, se_type)
+
+results_compare
+
+# VIF summary -------------------------------------------------------------
+vif_summary <- all_vif %>%
+  arrange(desc(vif))
+vif_summary
+
+vif_flags <- all_vif %>%
+  group_by(outcome) %>%
+  summarise(
+    max_vif = max(vif, na.rm = TRUE),
+    any_vif_gt5  = any(vif > 5, na.rm = TRUE),
+    any_vif_gt10 = any(vif > 10, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(max_vif))
+vif_flags
+```
+
+
+# Adjusted prediction figures
+
+```{r prediction-figures}
+# Outcome names
+outcome_md <- "coree_chen_dwi_measures_tensor_gm_gmcort_desc_adc_cerebral_cortex_z_site"
+
+outcome_fwf <- "coree_chen_dwi_measures_noddi_gm_gmcort_fit_fwf_cerebral_cortex_z_site"
+
+# Reusable prediction-grid function
+make_pred_grid <- function(data, mvpa_var = "mvpa_min_z", n = 150) {
+
+  mvpa_seq <- seq(
+    min(data[[mvpa_var]], na.rm = TRUE),
+    max(data[[mvpa_var]], na.rm = TRUE),
+    length.out = n
+  )
+
+  # Numeric covariates: mean
+  typical <- data %>%
+    summarise(
+      across(
+        everything(),
+        ~ if (is.numeric(.x)) mean(.x, na.rm = TRUE) else NA
+      )
+    )
+
+  nd <- typical[rep(1, n), , drop = FALSE]
+  nd[[mvpa_var]] <- mvpa_seq
+
+  # Factor covariates: modal/most common level
+  factor_vars <- names(data)[sapply(data, is.factor)]
+
+  for (v in factor_vars) {
+    modal_level <- names(which.max(table(data[[v]])))
+    nd[[v]] <- factor(modal_level, levels = levels(data[[v]]))
+  }
+
+  nd
+}
+
+# Reusable plot function
+plot_mvpa_prediction <- function(
+    outcome,
+    model_list,
+    data,
+    y_label,
+    plot_title = ""
+) {
+
+  m <- model_list[[outcome]]$model
+
+  nd <- make_pred_grid(
+    data = data,
+    mvpa_var = "mvpa_min_z",
+    n = 150
+  )
+
+  pred <- predict(
+    m,
+    newdata = nd,
+    interval = "confidence",
+    level = 0.95
+  )
+
+  pred_df <- bind_cols(
+    nd %>% dplyr::select(mvpa_min_z),
+    as_tibble(pred)
+  )
+
+  ggplot(pred_df, aes(x = mvpa_min_z, y = fit)) +
+    geom_ribbon(
+      aes(ymin = lwr, ymax = upr),
+      alpha = 0.20,
+      linewidth = 0
+    ) +
+    geom_line(linewidth = 1.2) +
+    labs(
+      x = "MVPA, standardized",
+      y = y_label,
+      title = plot_title
+    ) +
+    theme_classic(base_size = 12)
+}
+
+# MD plot
+p_mvpa_md <- plot_mvpa_prediction(
+  outcome = outcome_md,
+  model_list = fits,
+  data = df_pr,
+  y_label = "Cortical MD, z-scored within site",
+  plot_title = "MVPA and cortical mean diffusivity"
+)
+
+# FWF plot
+p_mvpa_fwf <- plot_mvpa_prediction(
+  outcome = outcome_fwf,
+  model_list = fits,
+  data = df_pr,
+  y_label = "Cortical FWF, z-scored within site",
+  plot_title = "MVPA and cortical free-water fraction"
+)
+
+print(p_mvpa_md)
+print(p_mvpa_fwf)
+
+ggsave(
+  filename = file.path(output_dir, "mvpa_cortical_md_prediction.png"),
+  plot = p_mvpa_md,
+  width = 5.5,
+  height = 4,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(output_dir, "mvpa_cortical_fwf_prediction.png"),
+  plot = p_mvpa_fwf,
+  width = 5.5,
+  height = 4,
+  dpi = 300
+)
+
+p_mvpa_md + p_mvpa_fwf +
+  plot_layout(ncol = 2)
+
+p_mvpa_md_fwf <- p_mvpa_md + p_mvpa_fwf +
+  plot_layout(ncol = 2)
+
+ggsave(
+  filename = file.path(output_dir, "mvpa_md_fwf_prediction_combined.png"),
+  plot = p_mvpa_md_fwf,
+  width = 10,
+  height = 4,
+  dpi = 300
+)
+```
+
+
+# Partial regression figures
+
+```{r partial-figures}
+# Outcomes to plot
+outcome_md <- "coree_chen_dwi_measures_tensor_gm_gmcort_desc_adc_cerebral_cortex_z_site"
+
+outcome_fwf <- "coree_chen_dwi_measures_noddi_gm_gmcort_fit_fwf_cerebral_cortex_z_site"
+
+# Covariates and other PA predictor to adjust for
+rhs_no_mvpa <- c(
+  setdiff(predictors_z, "mvpa_min_z"),
+  covariates
+)
+
+# Function to create partial regression dataframe
+make_partial_df <- function(data, outcome, predictor = "mvpa_min_z", covariates_adjust) {
+
+  f_y <- as.formula(
+    paste(outcome, "~", paste(covariates_adjust, collapse = " + "))
+  )
+
+  f_x <- as.formula(
+    paste(predictor, "~", paste(covariates_adjust, collapse = " + "))
+  )
+
+  vars_needed <- unique(c(outcome, predictor, covariates_adjust))
+
+  df_partial <- data %>%
+    dplyr::select(all_of(vars_needed)) %>%
+    tidyr::drop_na() %>%
+    dplyr::filter(if_all(where(is.numeric), is.finite))
+
+  ry <- resid(lm(f_y, data = df_partial))
+  rx <- resid(lm(f_x, data = df_partial))
+
+  tibble(
+    mvpa_partial = rx,
+    outcome_partial = ry
+  )
+}
+
+# Function to plot partial regression in your desired visual style
+plot_partial_mvpa <- function(partial_df, y_label) {
+
+  ggplot(partial_df, aes(x = mvpa_partial, y = outcome_partial)) +
+    geom_point(
+      color = "black",
+      alpha = 0.55,
+      size = 2.2
+    ) +
+    geom_smooth(
+      method = "lm",
+      se = TRUE,
+      color = "#2F55F5",
+      fill = "gray70",
+      linewidth = 1.3
+    ) +
+    labs(
+      x = "Moderate to Vigorous Physical Activity",
+      y = y_label
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      panel.background = element_rect(),
+      plot.background = element_rect(fill = "white", color = NA),
+      axis.line = element_line(color = "black", linewidth = 0.8),
+      axis.ticks = element_line(color = "black", linewidth = 0.8),
+      axis.text = element_text(color = "black", size = 12),
+      axis.title = element_text(color = "black", size = 16)
+    )
+}
+
+# Create partial regression dataframes
+partial_md <- make_partial_df(
+  data = df_pr,
+  outcome = outcome_md,
+  predictor = "mvpa_min_z",
+  covariates_adjust = rhs_no_mvpa
+)
+
+partial_fwf <- make_partial_df(
+  data = df_pr,
+  outcome = outcome_fwf,
+  predictor = "mvpa_min_z",
+  covariates_adjust = rhs_no_mvpa
+)
+
+# Create plots
+p_partial_md <- plot_partial_mvpa(
+  partial_df = partial_md,
+  y_label = "Cortical Mean Diffusivity"
+)
+
+p_partial_fwf <- plot_partial_mvpa(
+  partial_df = partial_fwf,
+  y_label = "Cortical Free-Water Fraction"
+)
+
+# Print separately
+print(p_partial_md)
+print(p_partial_fwf)
+
+# Optional: side-by-side figure
+p_partial_md_fwf <- p_partial_md + p_partial_fwf +
+  plot_layout(ncol = 2)
+
+print(p_partial_md_fwf)
+
+# Optional: save figures
+ggsave(
+  filename = file.path(output_dir, "mvpa_partial_md.png"),
+  plot = p_partial_md,
+  width = 7,
+  height = 4.8,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(output_dir, "mvpa_partial_fwf.png"),
+  plot = p_partial_fwf,
+  width = 7,
+  height = 4.8,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(output_dir, "mvpa_partial_md_fwf_combined.png"),
+  plot = p_partial_md_fwf,
+  width = 11,
+  height = 4.8,
+  dpi = 300
+)
+```
+
+
+# Cortical volume and sex interaction models
+
+The separate cortical volume and sex interaction outputs use conventional OLS inference, as in the source.
+
+```{r secondary-models}
+model_cortexvol <- lm(
+  cortexvol_norm_etiv ~ mvpa_min_z + mean_daily_10hr_steps_z +
+    age_hml + sex_hml + edu_cat + race_cat +
+    apoe_e4_carrier + days_of_recording + site +
+    hispanic_latino_hml + vascular_risk_cat,
+  data = df_pr
+)
+
+summary(model_cortexvol)
+
+run_lm_sex_int <- function(outcome, covariates, data) {
+
+  f <- as.formula(
+    paste(
+      outcome, "~",
+      paste(
+        c(
+          "mvpa_min_z * sex_hml",
+          "mean_daily_10hr_steps_z * sex_hml",
+          setdiff(covariates, "sex_hml")
+        ),
+        collapse = " + "
+      )
+    )
+  )
+
+  lm(f, data = data)
+}
+
+fits_sex <- purrr::map(
+  outcomes_z,
+  ~ run_lm_sex_int(
+    outcome    = .x,
+    covariates = covariates,
+    data       = df_pr
+  )
+)
+
+names(fits_sex) <- outcomes_z
+
+results_sex_int <- purrr::map_dfr(
+  fits_sex,
+  ~ broom::tidy(.x, conf.int = TRUE),
+  .id = "outcome"
+)
+
+# inspect all model terms first
+results_sex_int %>%
+  dplyr::distinct(term) %>%
+  dplyr::arrange(term)
+
+# extract both interaction terms regardless of order
+results_sex_int_interactions <- results_sex_int %>%
+  dplyr::filter(
+    (stringr::str_detect(term, "mvpa_min_z") &
+     stringr::str_detect(term, "sex_hml")) |
+    (stringr::str_detect(term, "mean_daily_10hr_steps_z") &
+     stringr::str_detect(term, "sex_hml"))
+  ) %>%
+  dplyr::mutate(
+    p_fdr = p.adjust(p.value, method = "fdr")
+  ) %>%
+  dplyr::arrange(outcome, term)
+
+results_sex_int_interactions %>%
+  dplyr::select(outcome, term, estimate, std.error, conf.low, conf.high, p.value, p_fdr)
+```
+
+
+# Global standardization sensitivity analyses
+
+```{r site-sensitivity}
+fits_global_z <- purrr::map(
+  outcomes_global_z,
+  ~ run_lm(
+    outcome      = .x,
+    predictors_z = predictors_z,
+    covariates   = covariates,  # includes site
+    data         = df_pr,
+    robust_type  = "HC3"
+  )
+)
+
+names(fits_global_z) <- outcomes_global_z
+
+results_global_z <- purrr::map_dfr(fits_global_z, "tidy_robust") %>%
+  filter(term %in% predictors_z) %>%
+  mutate(
+    p_fdr = p.adjust(p.value, method = "fdr"),
+    analysis = "Global-z outcomes + site covariate"
+  ) %>%
+  dplyr::select(
+    analysis, outcome, term, estimate, std.error,
+    conf.low, conf.high, p.value, p_fdr, se_type
+  )
+
+results_global_z
+
+# 9B) Sensitivity: globally z-scored outcomes with PA × site interactions
+
+run_lm_site_int <- function(outcome, covariates, data, robust_type = "HC3") {
+
+  # Remove site from covariates because it is already included in the interaction terms
+  covars_no_site <- setdiff(covariates, "site")
+
+  f <- as.formula(
+    paste(
+      outcome, "~",
+      paste(
+        c(
+          "mvpa_min_z * site",
+          "mean_daily_10hr_steps_z * site",
+          covars_no_site
+        ),
+        collapse = " + "
+      )
+    )
+  )
+
+  lm_fit <- lm(f, data = data)
+
+  vcov_rob <- sandwich::vcovHC(lm_fit, type = robust_type)
+  ct_rob <- lmtest::coeftest(lm_fit, vcov. = vcov_rob)
+
+  tidy_rob <- broom::tidy(ct_rob) %>%
+    mutate(
+      conf.low = estimate - qt(0.975, df = df.residual(lm_fit)) * std.error,
+      conf.high = estimate + qt(0.975, df = df.residual(lm_fit)) * std.error,
+      outcome = outcome,
+      se_type = robust_type
+    ) %>%
+    dplyr::select(
+      term, estimate, std.error, statistic, p.value,
+      conf.low, conf.high, outcome, se_type
+    )
+
+  list(
+    model = lm_fit,
+    tidy_robust = tidy_rob
+  )
+}
+
+fits_site_int_global_z <- purrr::map(
+  outcomes_global_z,
+  ~ run_lm_site_int(
+    outcome    = .x,
+    covariates = covariates,
+    data       = df_pr,
+    robust_type = "HC3"
+  )
+)
+
+names(fits_site_int_global_z) <- outcomes_global_z
+
+results_site_int_global_z <- purrr::map_dfr(
+  fits_site_int_global_z,
+  "tidy_robust"
+) %>%
+  filter(
+    stringr::str_detect(term, "mvpa_min_z:site") |
+      stringr::str_detect(term, "mean_daily_10hr_steps_z:site")
+  ) %>%
+  mutate(
+    p_fdr = p.adjust(p.value, method = "fdr"),
+    analysis = "Global-z outcomes + PA × site interactions"
+  ) %>%
+  arrange(outcome, term)
+
+results_site_int_global_z %>%
+  dplyr::select(
+    analysis, outcome, term, estimate, std.error,
+    conf.low, conf.high, p.value, p_fdr
+  )
+```
+
+
+# Influence screening
+
+These are the exploratory thresholds in the original script (Cook’s distance > 4/N, leverage > 2p/N, DFBETA > 2/√N). They differ from the manuscript’s stated screening thresholds; no observations are excluded here.
+
+```{r influence-screening}
+check_influence <- function(model, outcome_name) {
+  n <- nobs(model)
+  p <- length(coef(model))
+
+  cooks_d <- cooks.distance(model)
+  hat_vals <- hatvalues(model)
+  dfb <- dfbetas(model)
+
+  # if only one coefficient, dfbetas can come back as a vector
+  if (is.null(dim(dfb))) {
+    max_dfb <- abs(dfb)
+  } else {
+    max_dfb <- apply(abs(dfb), 1, max, na.rm = TRUE)
+  }
+
+  infl_df <- tibble(
+    obs = seq_len(n),
+    cooks_d = cooks_d,
+    hat = hat_vals,
+    max_dfbeta = max_dfb,
+    cooks_flag = cooks_d > (4 / n),
+    leverage_flag = hat_vals > (2 * p / n),
+    dfb_flag = max_dfb > (2 / sqrt(n)),
+    outcome = outcome_name
+  )
+
+  infl_df
+}
+
+influence_results <- purrr::map_dfr(
+  fits,
+  ~ check_influence(.x$model, outcome_name = deparse(formula(.x$model)[[2]]))
+)
+
+influence_flags <- influence_results %>%
+  filter(cooks_flag | leverage_flag | dfb_flag)
+
+influence_flags
+```
+
+
+# Optional extended diagnostics
+
+Enable `run_extended_diagnostics` to run leave-one-out and robust regression on the same complete-case sample as the primary model. Requires MASS.
+
+```{r extended-diagnostics, eval=params$run_extended_diagnostics}
+outcome_plot <- outcome_md
+m <- fits[[outcome_plot]]$model
+
+infl <- broom::augment(m) %>%
+  mutate(
+    std_resid = rstandard(m),
+    cooksd   = cooks.distance(m),
+    hat      = hatvalues(m)
+  )
+
+infl_flags <- infl %>%
+  mutate(
+    high_resid = abs(std_resid) > 3,
+    high_cook  = cooksd > (4 / nrow(infl)),
+    high_hat   = hat > (2 * mean(hat))
+  ) %>%
+  filter(high_resid | high_cook | high_hat)
+
+infl_flags
+
+ggplot(infl, aes(x = seq_along(cooksd), y = cooksd)) +
+  geom_point() +
+  geom_hline(yintercept = 4 / nrow(infl), linetype = "dashed", color = "red") +
+  labs(y = "Cook's distance", x = "Observation") +
+  theme_classic()
+
+ggplot(infl, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic()
+
+mvpa_effects <- map_dfr(seq_len(nrow(df_pr)), function(i) {
+  m_i <- lm(
+    formula(m),
+    data = df_pr[-i, ]
+  )
+  tidy(m_i) %>%
+    filter(term == "mvpa_min_z") %>%
+    mutate(dropped_row = i)
+})
+
+summary(mvpa_effects$estimate)
+
+coef_full <- tidy(m) %>% filter(term == "mvpa_min_z")
+
+coef_full
+quantile(mvpa_effects$estimate, c(.025, .5, .975))
+
+m_robust <- MASS::rlm(
+  formula(m),
+  data = df_pr
+)
+
+tidy(m_robust) %>% filter(term == "mvpa_min_z")
+```
+
+
+# Reproducibility
+
+```{r session-info}
+sessionInfo()
+```
