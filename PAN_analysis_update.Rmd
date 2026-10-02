@@ -1,4 +1,4 @@
----
+--
 title: "PAN Physical Activity and Cortical Microstructure Analysis"
 output:
   html_document:
@@ -9,12 +9,12 @@ output:
 params:
   data_file: "/Users/danielcallow/Downloads/data_export_2026-01-26 16_08_34.090270.csv"
   output_dir: "PAN_outputs"
-  run_extended_diagnostics: false
 ---
 
-This report contains the current physical activity and cortical microstructure
-analysis. Set `data_file` and `output_dir` in the parameters above before knitting. The original filtering, recoding, standardization populations, regression
-formulas, HC3 inference, and FDR families are retained in the main analysis.
+This report focuses on the analyses reported in the PAN manuscript, including
+Tables 1 and 2, Figure 1, secondary analyses, and sensitivity analyses. Set `data_file` and `output_dir` in the parameters above before knitting. Existing primary filtering, recoding, standardization, and model specifications
+are preserved. Separate-predictor, volume-adjustment, and MoCA-exclusion models
+are added from the manuscript Methods; their numerical agreement requires verification.
 
 The final complete-case sample is `df_pr`. Outcomes are standardized before
 filtering, and predictors after eligibility filtering but before complete-case
@@ -24,7 +24,7 @@ OLS inference; the main result tables use HC3 standard errors.
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE)
 required_packages <- c(
-  "tidyverse", "janitor", "broom", "car", "GGally", "gtsummary",
+  "tidyverse", "janitor", "broom", "car", "gtsummary",
   "gt", "lmtest", "sandwich", "patchwork"
 )
 missing_packages <- required_packages[
@@ -478,60 +478,14 @@ biv_pearson <- get_cor_results(df_biv, vars_biv, method = "pearson") %>%
     p_fdr = signif(p_fdr, 3)
   )
 
-biv_spearman <- get_cor_results(df_biv, vars_biv, method = "spearman") %>%
-  mutate(
-    estimate = round(estimate, 3),
-    conf.low = round(conf.low, 3),
-    conf.high = round(conf.high, 3),
-    p.value = signif(p.value, 3),
-    p_fdr = signif(p_fdr, 3)
+biv_pearson_reported <- biv_pearson %>%
+  filter(
+    (var1 == "MVPA" & var2 == "Steps") |
+      (var1 %in% c("MD_GM", "FWF_GM", "NDI_GM", "ODI_GM") &
+         var2 %in% c("MD_GM", "FWF_GM", "NDI_GM", "ODI_GM"))
   )
+biv_pearson_reported
 
-biv_pearson
-biv_spearman
-```
-
-
-# Bivariate figure
-
-```{r bivariate-figure}
-panel_cor <- function(data, mapping, digits = 3, prefix = "Corr: ", method = "pearson", ...) {
-  x <- eval_data_col(data, mapping$x)
-  y <- eval_data_col(data, mapping$y)
-
-  test <- suppressWarnings(cor.test(x, y, method = method))
-  r <- unname(test$estimate)
-  p <- test$p.value
-
-  stars <- case_when(
-    p < .001 ~ "***",
-    p < .01  ~ "**",
-    p < .05  ~ "*",
-    TRUE ~ ""
-  )
-
-  label <- paste0(prefix, "\n", format(round(r, digits), nsmall = digits), stars)
-
-  ggally_text(
-    label = label,
-    mapping = aes(),
-    xP = 0.5,
-    yP = 0.5,
-    size = 8,
-    color = "grey40"
-  ) +
-    theme_void()
-}
-
-p_pairs <- GGally::ggpairs(
-  df_biv,
-  upper = list(continuous = wrap(panel_cor, method = "pearson")),
-  lower = list(continuous = wrap("smooth_loess", alpha = 0.5, size = 0.2)),
-  diag  = list(continuous = "densityDiag")
-) +
-  theme_bw(base_size = 14)
-
-p_pairs
 ```
 
 
@@ -615,7 +569,7 @@ table1
 
 # Primary regression results
 
-The original FDR adjustment spans both activity predictors across all five outcomes. This is preserved; it is broader than the manuscript’s stated NODDI-only family.
+The original FDR adjustment spans both activity predictors across all five outcomes and is retained as `p_fdr`. NODDI-only adjustments are also displayed below by activity predictor; the manuscript does not specify whether both predictors belong to one family. MD is not a NODDI-derived measure, although Table 2 marks it with the NODDI FDR footnote.
 
 ```{r primary-models}
 fits <- purrr::map(
@@ -646,40 +600,22 @@ results_main <- all_tidy_robust %>%
 
 results_main
 
-# Optional comparison table: OLS vs HC3 ----------------------------------
-results_compare <- bind_rows(
-  all_tidy_ols %>%
-    filter(term %in% predictors_z) %>%
-    dplyr::select(outcome, term, estimate, std.error, conf.low, conf.high, p.value, se_type),
-  all_tidy_robust %>%
-    filter(term %in% predictors_z) %>%
-    dplyr::select(outcome, term, estimate, std.error, conf.low, conf.high, p.value, se_type)
-) %>%
-  arrange(outcome, term, se_type)
+# Explicit NODDI-only families, separately for each activity predictor.
+results_noddi_fdr <- all_tidy_robust %>%
+  filter(term %in% predictors_z, grepl("noddi", outcome)) %>%
+  group_by(term) %>%
+  mutate(p_fdr_noddi = p.adjust(p.value, method = "BH")) %>%
+  ungroup()
+results_noddi_fdr
 
-results_compare
+# Full coefficients support the covariate findings reported in the Results.
+results_covariates <- all_tidy_robust %>%
+  filter(!term %in% c("(Intercept)", predictors_z))
+results_covariates
 
-# VIF summary -------------------------------------------------------------
-vif_summary <- all_vif %>%
-  arrange(desc(vif))
-vif_summary
-
-vif_flags <- all_vif %>%
-  group_by(outcome) %>%
-  summarise(
-    max_vif = max(vif, na.rm = TRUE),
-    any_vif_gt5  = any(vif > 5, na.rm = TRUE),
-    any_vif_gt10 = any(vif > 10, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  arrange(desc(max_vif))
-vif_flags
 ```
 
 
-# Adjusted prediction figures
-
-```{r prediction-figures}
 # Outcome names
 outcome_md <- "coree_chen_dwi_measures_tensor_gm_gmcort_desc_adc_cerebral_cortex_z_site"
 
@@ -886,84 +822,19 @@ plot_partial_mvpa <- function(partial_df, y_label) {
     )
 }
 
-# Create partial regression dataframes
-partial_md <- make_partial_df(
-  data = df_pr,
-  outcome = outcome_md,
-  predictor = "mvpa_min_z",
-  covariates_adjust = rhs_no_mvpa
-)
-
-partial_fwf <- make_partial_df(
-  data = df_pr,
-  outcome = outcome_fwf,
-  predictor = "mvpa_min_z",
-  covariates_adjust = rhs_no_mvpa
-)
-
-# Create plots
-p_partial_md <- plot_partial_mvpa(
-  partial_df = partial_md,
-  y_label = "Cortical Mean Diffusivity"
-)
-
-p_partial_fwf <- plot_partial_mvpa(
-  partial_df = partial_fwf,
-  y_label = "Cortical Free-Water Fraction"
-)
-
-# Print separately
+# Figure 1: model-consistent residualization includes step count.
+partial_md <- make_partial_df(df_pr, outcome_md, "mvpa_min_z", rhs_no_mvpa)
+p_partial_md <- plot_partial_mvpa(partial_md, "Cortical Mean Diffusivity")
 print(p_partial_md)
-print(p_partial_fwf)
-
-# Optional: side-by-side figure
-p_partial_md_fwf <- p_partial_md + p_partial_fwf +
-  plot_layout(ncol = 2)
-
-print(p_partial_md_fwf)
-
-# Optional: save figures
-ggsave(
-  filename = file.path(output_dir, "mvpa_partial_md.png"),
-  plot = p_partial_md,
-  width = 7,
-  height = 4.8,
-  dpi = 300
-)
-
-ggsave(
-  filename = file.path(output_dir, "mvpa_partial_fwf.png"),
-  plot = p_partial_fwf,
-  width = 7,
-  height = 4.8,
-  dpi = 300
-)
-
-ggsave(
-  filename = file.path(output_dir, "mvpa_partial_md_fwf_combined.png"),
-  plot = p_partial_md_fwf,
-  width = 11,
-  height = 4.8,
-  dpi = 300
-)
+ggsave(file.path(output_dir, "Figure1_mvpa_cortical_md.png"),
+       plot = p_partial_md, width = 7, height = 4.8, dpi = 300)
 ```
 
+# Sex interaction analyses
 
-# Cortical volume and sex interaction models
-
-The separate cortical volume and sex interaction outputs use conventional OLS inference, as in the source.
+Sex interaction outputs retain conventional OLS inference from the original script.
 
 ```{r secondary-models}
-model_cortexvol <- lm(
-  cortexvol_norm_etiv ~ mvpa_min_z + mean_daily_10hr_steps_z +
-    age_hml + sex_hml + edu_cat + race_cat +
-    apoe_e4_carrier + days_of_recording + site +
-    hispanic_latino_hml + vascular_risk_cat,
-  data = df_pr
-)
-
-summary(model_cortexvol)
-
 run_lm_sex_int <- function(outcome, covariates, data) {
 
   f <- as.formula(
@@ -1022,6 +893,54 @@ results_sex_int_interactions %>%
   dplyr::select(outcome, term, estimate, std.error, conf.low, conf.high, p.value, p_fdr)
 ```
 
+
+
+# Separate activity predictors
+
+These models use the primary complete-case sample and covariates, with one activity
+predictor at a time. HC3 inference follows the manuscript's regression approach.
+
+```{r separate-predictors}
+results_separate <- purrr::map_dfr(predictors_z, function(activity) {
+  purrr::map_dfr(outcomes_z, function(outcome) {
+    run_lm(outcome, activity, covariates, df_pr)$tidy_robust %>%
+      filter(term == activity)
+  })
+})
+results_separate
+```
+
+# Cortical volume adjustment
+
+The Methods specify diffusion outcomes as dependent variables with normalized
+cortical volume as an additional covariate. This implements that specification;
+the Results phrase describing both imaging measures as predictors needs clarification.
+
+```{r volume-adjustment}
+diffusion_outcomes <- setdiff(outcomes_z, "cortexvol_norm_etiv_z_site")
+results_volume_adjusted <- purrr::map_dfr(diffusion_outcomes, function(outcome) {
+  run_lm(outcome, predictors_z,
+         c(covariates, "cortexvol_norm_etiv"), df_pr)$tidy_robust %>%
+    filter(term %in% predictors_z)
+})
+results_volume_adjusted
+```
+
+# Exclude possible cognitive impairment
+
+The manuscript excludes MoCA scores below 24. Existing standardizations are retained,
+so this tests exclusion without changing the units of the primary coefficients.
+
+```{r moca-sensitivity}
+df_no_impairment <- df_pr %>% filter(moca_total >= 24)
+cat("Excluded with MoCA < 24:", nrow(df_pr) - nrow(df_no_impairment), "\n")
+cat("Sensitivity sample:", nrow(df_no_impairment), "\n")
+results_no_impairment <- purrr::map_dfr(outcomes_z, function(outcome) {
+  run_lm(outcome, predictors_z, covariates, df_no_impairment)$tidy_robust %>%
+    filter(term %in% predictors_z)
+})
+results_no_impairment
+```
 
 # Global standardization sensitivity analyses
 
@@ -1127,114 +1046,6 @@ results_site_int_global_z %>%
     analysis, outcome, term, estimate, std.error,
     conf.low, conf.high, p.value, p_fdr
   )
-```
-
-
-# Influence screening
-
-These are the exploratory thresholds in the original script (Cook’s distance > 4/N, leverage > 2p/N, DFBETA > 2/√N). They differ from the manuscript’s stated screening thresholds; no observations are excluded here.
-
-```{r influence-screening}
-check_influence <- function(model, outcome_name) {
-  n <- nobs(model)
-  p <- length(coef(model))
-
-  cooks_d <- cooks.distance(model)
-  hat_vals <- hatvalues(model)
-  dfb <- dfbetas(model)
-
-  # if only one coefficient, dfbetas can come back as a vector
-  if (is.null(dim(dfb))) {
-    max_dfb <- abs(dfb)
-  } else {
-    max_dfb <- apply(abs(dfb), 1, max, na.rm = TRUE)
-  }
-
-  infl_df <- tibble(
-    obs = seq_len(n),
-    cooks_d = cooks_d,
-    hat = hat_vals,
-    max_dfbeta = max_dfb,
-    cooks_flag = cooks_d > (4 / n),
-    leverage_flag = hat_vals > (2 * p / n),
-    dfb_flag = max_dfb > (2 / sqrt(n)),
-    outcome = outcome_name
-  )
-
-  infl_df
-}
-
-influence_results <- purrr::map_dfr(
-  fits,
-  ~ check_influence(.x$model, outcome_name = deparse(formula(.x$model)[[2]]))
-)
-
-influence_flags <- influence_results %>%
-  filter(cooks_flag | leverage_flag | dfb_flag)
-
-influence_flags
-```
-
-
-# Optional extended diagnostics
-
-Enable `run_extended_diagnostics` to run leave-one-out and robust regression on the same complete-case sample as the primary model. Requires MASS.
-
-```{r extended-diagnostics, eval=params$run_extended_diagnostics}
-outcome_plot <- outcome_md
-m <- fits[[outcome_plot]]$model
-
-infl <- broom::augment(m) %>%
-  mutate(
-    std_resid = rstandard(m),
-    cooksd   = cooks.distance(m),
-    hat      = hatvalues(m)
-  )
-
-infl_flags <- infl %>%
-  mutate(
-    high_resid = abs(std_resid) > 3,
-    high_cook  = cooksd > (4 / nrow(infl)),
-    high_hat   = hat > (2 * mean(hat))
-  ) %>%
-  filter(high_resid | high_cook | high_hat)
-
-infl_flags
-
-ggplot(infl, aes(x = seq_along(cooksd), y = cooksd)) +
-  geom_point() +
-  geom_hline(yintercept = 4 / nrow(infl), linetype = "dashed", color = "red") +
-  labs(y = "Cook's distance", x = "Observation") +
-  theme_classic()
-
-ggplot(infl, aes(.fitted, .resid)) +
-  geom_point(alpha = 0.6) +
-  geom_hline(yintercept = 0, linetype = "dashed") +
-  theme_classic()
-
-mvpa_effects <- map_dfr(seq_len(nrow(df_pr)), function(i) {
-  m_i <- lm(
-    formula(m),
-    data = df_pr[-i, ]
-  )
-  tidy(m_i) %>%
-    filter(term == "mvpa_min_z") %>%
-    mutate(dropped_row = i)
-})
-
-summary(mvpa_effects$estimate)
-
-coef_full <- tidy(m) %>% filter(term == "mvpa_min_z")
-
-coef_full
-quantile(mvpa_effects$estimate, c(.025, .5, .975))
-
-m_robust <- MASS::rlm(
-  formula(m),
-  data = df_pr
-)
-
-tidy(m_robust) %>% filter(term == "mvpa_min_z")
 ```
 
 
